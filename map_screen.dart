@@ -231,52 +231,99 @@ class _MapScreenState extends State<MapScreen> {
   }
 
   /// Отрисовка камер, засад, светофоров и ПВК на карте
+  /// Используем встроенные Material Icons вместо emoji для совместимости
   Future<void> _displayRoadEventsOnMap(List<RoadEvent> events) async {
     if (_mapController == null) return;
 
     await _mapController!.clearSymbols();
 
     for (final event in events) {
-      String label = '';
+      String displayText = '';
+      Color iconColor = Colors.red;
+      IconData iconData = Icons.location_on;
+
       switch (event.type) {
         case RoadEventType.speedCamera:
         case RoadEventType.averageSpeed:
         case RoadEventType.mobileCamera:
-          label = event.speedLimit > 0 ? '📷 ${event.speedLimit}' : '📷 Камера';
+          displayText = event.speedLimit > 0 ? '${event.speedLimit}' : 'CAM';
+          iconData = Icons.videocam;
+          iconColor = Colors.red;
+          break;
+        case RoadEventType.trafficLight:
+          displayText = 'TL';
+          iconData = Icons.traffic;
+          iconColor = Colors.amber;
           break;
         case RoadEventType.redLight:
-          label = '🚦 Светофор';
+          displayText = 'RL';
+          iconData = Icons.traffic;
+          iconColor = Colors.red;
           break;
         case RoadEventType.weightControl:
-          label = '⚖️ ПВК';
+          displayText = 'PVK';
+          iconData = Icons.scale;
+          iconColor = Colors.orange;
           break;
         case RoadEventType.heightLimit:
           final h = event.attributes['height_m'] ?? event.attributes['height'] ?? '';
-          label = h.toString().isNotEmpty ? '🚨 Мост ${h}м' : '🚨 Габарит';
+          displayText = h.toString().isNotEmpty ? '${h}m' : 'H';
+          iconData = Icons.height;
+          iconColor = Colors.amber;
           break;
         case RoadEventType.tollBooth:
-          label = '💳 ПВП';
+          displayText = 'PVP';
+          iconData = Icons.attach_money;
+          iconColor = Colors.teal;
+          break;
+        case RoadEventType.speedBump:
+          displayText = 'SB';
+          iconData = Icons.waves;
+          iconColor = Colors.brown;
+          break;
+        case RoadEventType.pedestrian:
+          displayText = 'PED';
+          iconData = Icons.directions_walk;
+          iconColor = Colors.blue;
+          break;
+        case RoadEventType.railwayCrossing:
+          displayText = 'RW';
+          iconData = Icons.train;
+          iconColor = Colors.indigo;
           break;
         case RoadEventType.dangerZone:
-          label = '⚠️ Опасно';
+          displayText = '!';
+          iconData = Icons.warning;
+          iconColor = Colors.red;
           break;
         case RoadEventType.unknown:
         default:
-          label = '📍 Объект';
+          displayText = '?';
+          iconData = Icons.help;
+          iconColor = Colors.blueGrey;
+          break;
       }
 
+      // Добавляем символ с текстом вместо emoji
+      // Это совместимо с Android эмулятором
       await _mapController!.addSymbol(
         SymbolOptions(
           geometry: LatLng(event.lat, event.lon),
-          textField: label,
-          textSize: 13.0,
-          textColor: '#D32F2F',
-          textHaloColor: '#FFFFFF',
-          textHaloWidth: 2.0,
-          textOffset: const Offset(0, 0.5),
+          textField: displayText,
+          textSize: 12.0,
+          textColor: '#FFFFFF', // Белый текст
+          textHaloColor: _colorToHex(iconColor), // Цвет иконы как фон
+          textHaloWidth: 3.0, // Толщина "ореола" создает эффект кружка
+          textOffset: const Offset(0, 0),
+          iconSize: 1.0,
         ),
       );
     }
+  }
+
+  /// Вспомогательный метод преобразования Color в hex string для MapLibre
+  String _colorToHex(Color color) {
+    return '#${color.value.toRadixString(16).padLeft(8, '0').substring(2)}';
   }
 
   Future<void> _buildRoute(RigProfile rig) async {
@@ -744,7 +791,7 @@ class _RouteSummary extends StatelessWidget {
                     borderRadius: BorderRadius.circular(8),
                   ),
                   child: Text(
-                    '📷 Постов/Камер: $eventsCount',
+                    'Объектов: $eventsCount',
                     style: const TextStyle(
                       fontSize: 11,
                       color: AppColors.danger,
