@@ -5,6 +5,7 @@ import 'package:flutter/services.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:path/path.dart';
 import 'package:sqflite/sqflite.dart';
+import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 
 import '../models/rig_profile.dart';
 import '../models/road_event.dart';
@@ -14,35 +15,125 @@ class RoadEventService {
   RoadEventService._internal();
 
   Database? _db;
+  bool _isInitialized = false;
 
-  /// Инициализация и подготовка базы данных SQLite
+  /// Инициализация и подготовка базы данных SQLite с поддержкой R*Tree
   Future<void> init() async {
-    if (_db != null && _db!.isOpen) return;
+    if (_isInitialized && _db != null && _db!.isOpen) {
+      debugPrint('[🔹 RoadEventService] ✓ Database already initialized');
+      return;
+    }
 
     try {
-      final dbPath = await getDatabasesPath();
-      final path = join(dbPath, "cameras.db");
+      debugPrint('[🔹 RoadEventService] Starting initialization...');
 
-      if (!await File(path).exists()) {
-        final data = await rootBundle.load("assets/database/cameras.db");
-        final bytes = data.buffer.asUint8List(
-          data.offsetInBytes,
-          data.lengthInBytes,
-        );
-        await File(path).writeAsBytes(bytes, flush: true);
+      // 1. Гарантируем инициализацию FFI для поддержки R*Tree
+      if (Platform.isAndroid || Platform.isIOS) {
+        debugPrint('[🔹 RoadEventService] Platform: ${Platform.operatingSystem}');
+        sqfliteFfiInit();
+        // Используем databaseFactoryFfi вместо обычного databaseFactory!
+        final factory = databaseFactoryFfi;
+        debugPrint('[🔹 RoadEventService] ✓ FFI factory initialized');
       }
 
-      _db = await openDatabase(path, readOnly: true);
-    } catch (e) {
-      debugPrint("Ошибка при инициализации базы данных cameras.db: $e");
+      // 2. Получаем правильный путь к БД
+      final dbPath = await getDatabasesPath();
+      final path = join(dbPath, "cameras.db");
+      debugPrint('[🔹 RoadEventService] Database path: $path');
+
+      // 3. Создаем папку, если её нет
+      await Directory(dbPath).create(recursive: true);
+
+      // 4. Если БД не существует — копируем из assets
+      if (!await File(path).exists()) {
+        debugPrint('[🔹 RoadEventService] Copying cameras.db from assets...');
+        try {
+          final data = await rootBundle.load("assets/database/cameras.db");
+          final bytes = data.buffer.asUint8List(
+            data.offsetInBytes,
+            data.lengthInBytes,
+          );
+          await File(path).writeAsBytes(bytes, flush: true);
+          debugPrint('[🔹 RoadEventService] ✓ cameras.db copied (${bytes.length} bytes)');
+        } catch (e) {
+          debugPrint('[🔹 RoadEventService] ✗ Failed to copy from assets: $e');
+          rethrow;
+        }
+      } else {
+        final fileSize = await File(path).length();
+        debugPrint('[🔹 RoadEventService] ✓ cameras.db exists (${fileSize} bytes)');
+      }
+
+      // 5. КРИТИЧНО: Открываем БД через databaseFactoryFfi, а не openDatabase()!
+      debugPrint('[🔹 RoadEventService] Opening database via FFI...');
+      _db = await databaseFactoryFfi.openDatabase(
+        path,
+        options: OpenDatabaseOptions(
+          readOnly: true,
+          onOpen: (db) async {
+            debugPrint('[🔹 RoadEventService] ✓ Database opened successfully');
+
+            // Проверяем таблицы
+            try {
+              final tables = await db.query(
+                'sqlite_master',
+                where: "type='table' AND name LIKE '%speed_cameras%'",
+                columns: ['name'],
+              );
+
+              debugPrint('[🔹 RoadEventService] Found ${tables.length} speed_cameras tables:');
+              for (final table in tables) {
+                debugPrint('[🔹 RoadEventService]   • ${table['name']}');
+              }
+
+              // Проверяем R*Tree индекс
+              final rtreeCheck = await db.query(
+                'sqlite_master',
+                where: "type='table' AND name='speed_cameras_rtree'",
+                columns: ['name'],
+              );
+
+              if (rtreeCheck.isNotEmpty) {
+                debugPrint('[🔹 RoadEventService] ✓ R*Tree index FOUND and available');
+              } else {
+                debugPrint('[🔹 RoadEventService] ⚠ R*Tree index NOT found');
+              }
+
+              // Тестовый запрос
+              try {
+                final testResult = await db.rawQuery(
+                  'SELECT COUNT(*) as cnt FROM speed_cameras LIMIT 1'
+                );
+                final count = (testResult.first['cnt'] as int?) ?? 0;
+                debugPrint('[🔹 RoadEventService] ✓ Total cameras in DB: $count');
+              } catch (e) {
+                debugPrint('[🔹 RoadEventService] ⚠ Test query failed: $e');
+              }
+            } catch (e) {
+              debugPrint('[🔹 RoadEventService] ⚠ Table check error: $e');
+            }
+          },
+        ),
+      );
+
+      _isInitialized = true;
+      debugPrint('[🔹 RoadEventService] ✅ INITIALIZATION COMPLETE!');
+    } catch (e, stackTrace) {
+      debugPrint('[🔹 RoadEventService] ❌ CRITICAL ERROR: $e');
+      debugPrint('[🔹 RoadEventService] Stack: $stackTrace');
+      _isInitialized = false;
+      rethrow;
     }
   }
 
   /// Проверка подключения к БД с авто-инициализацией
   Future<void> _ensureInitialized() async {
-    if (_db == null || !_db!.isOpen) {
-      await init();
+    if (_isInitialized && _db != null && _db!.isOpen) {
+      return;
     }
+
+    debugPrint('[🔹 RoadEventService] Auto-initializing...');
+    await init();
   }
 
   /// 1. Загрузка событий в видимой области экрана (без построенного маршрута)
@@ -54,9 +145,14 @@ class RoadEventService {
     RigProfile? activeRig,
   }) async {
     await _ensureInitialized();
-    if (_db == null) return [];
+    if (_db == null || !_db!.isOpen) {
+      debugPrint('[🔹 RoadEventService] ✗ Database not initialized for bounds query');
+      return [];
+    }
 
     try {
+      debugPrint('[🔹 RoadEventService] Query bounds: lat($minLat-$maxLat) lon($minLon-$maxLon)');
+
       const query = '''
         SELECT c.id, c.source, c.external_id, c.lat, c.lon, c.azimuth, c.camera_type, c.speed_limit, c.attributes
         FROM speed_cameras c
@@ -70,19 +166,27 @@ class RoadEventService {
         [maxLon, minLon, maxLat, minLat],
       );
 
+      debugPrint('[🔹 RoadEventService] Found ${rawRows.length} events in bounds');
+
       final List<RoadEvent> events = [];
 
       for (final row in rawRows) {
-        final event = RoadEvent.fromSqflite(row);
+        try {
+          final event = RoadEvent.fromSqflite(row);
 
-        if (_shouldIncludeEvent(event, activeRig)) {
-          events.add(event);
+          if (_shouldIncludeEvent(event, activeRig)) {
+            events.add(event);
+          }
+        } catch (e) {
+          debugPrint('[🔹 RoadEventService] Error parsing event: $e');
         }
       }
 
+      debugPrint('[🔹 RoadEventService] ✓ Returning ${events.length} filtered events');
       return events;
-    } catch (e) {
-      debugPrint("Ошибка получения событий в границах экрана: $e");
+    } catch (e, stackTrace) {
+      debugPrint('[🔹 RoadEventService] ✗ Error in getEventsInBounds: $e');
+      debugPrint('[🔹 RoadEventService] Stack: $stackTrace');
       return [];
     }
   }
@@ -94,11 +198,17 @@ class RoadEventService {
         RigProfile? activeRig,
       }) async {
     await _ensureInitialized();
-    if (_db == null || routePoints.isEmpty) return [];
+    if (_db == null || !_db!.isOpen || routePoints.isEmpty) {
+      debugPrint('[🔹 RoadEventService] ✗ Database not ready or empty route');
+      return [];
+    }
 
     // Безопасно приводим входные точки к объектам LatLng
     final List<LatLng> parsedPoints = _parsePoints(routePoints);
-    if (parsedPoints.isEmpty) return [];
+    if (parsedPoints.isEmpty) {
+      debugPrint('[🔹 RoadEventService] ✗ No valid points in route');
+      return [];
+    }
 
     // 1. Вычисляем Bounding Box всего маршрута
     double minLat = parsedPoints.first.latitude;
@@ -120,6 +230,8 @@ class RoadEventService {
     maxLon += 0.003;
 
     try {
+      debugPrint('[🔹 RoadEventService] Query route: lat($minLat-$maxLat) lon($minLon-$maxLon)');
+
       // 2. Выборка через R-Tree
       const query = '''
         SELECT c.id, c.source, c.external_id, c.lat, c.lon, c.azimuth, c.camera_type, c.speed_limit, c.attributes
@@ -134,23 +246,32 @@ class RoadEventService {
         [maxLon, minLon, maxLat, minLat],
       );
 
+      debugPrint('[🔹 RoadEventService] Found ${rawRows.length} candidates near route');
+
       final List<RoadEvent> routeEvents = [];
 
       for (final row in rawRows) {
-        final event = RoadEvent.fromSqflite(row);
+        try {
+          final event = RoadEvent.fromSqflite(row);
 
-        // Проверка прилегания объекта к линии маршрута (до 35 метров)
-        if (_isNearPolyline(event.lat, event.lon, parsedPoints, maxDistanceMeters: 35.0)) {
-          // 3. ФИЛЬТРАЦИЯ: Легковой vs Грузовой
-          if (_shouldIncludeEvent(event, activeRig)) {
-            routeEvents.add(event);
+          // Проверка прилегания объекта к линии маршрута (до 35 метров)
+          if (_isNearPolyline(event.lat, event.lon, parsedPoints, maxDistanceMeters: 35.0)) {
+            // 3. ФИЛЬТРАЦИЯ: Легковой vs Грузовой
+            if (_shouldIncludeEvent(event, activeRig)) {
+              routeEvents.add(event);
+              debugPrint('[🔹 RoadEventService]   • Found: ${event.type.name} at (${event.lat}, ${event.lon})');
+            }
           }
+        } catch (e) {
+          debugPrint('[🔹 RoadEventService] Error parsing route event: $e');
         }
       }
 
+      debugPrint('[🔹 RoadEventService] ✓ Returning ${routeEvents.length} route events');
       return routeEvents;
-    } catch (e) {
-      debugPrint("Ошибка получения событий для маршрута: $e");
+    } catch (e, stackTrace) {
+      debugPrint('[🔹 RoadEventService] ✗ Error in getEventsForRoute: $e');
+      debugPrint('[🔹 RoadEventService] Stack: $stackTrace');
       return [];
     }
   }
@@ -250,5 +371,15 @@ class RoadEventService {
     final a = sin(dLat / 2) * sin(dLat / 2) +
         cos(lat1 * pi / 180.0) * cos(lat2 * pi / 180.0) * sin(dLon / 2) * sin(dLon / 2);
     return r * 2 * atan2(sqrt(a), sqrt(1 - a));
+  }
+
+  /// Закрытие БД при выходе из приложения
+  Future<void> close() async {
+    if (_db != null && _db!.isOpen) {
+      await _db!.close();
+      _db = null;
+      _isInitialized = false;
+      debugPrint('[🔹 RoadEventService] Database closed');
+    }
   }
 }
