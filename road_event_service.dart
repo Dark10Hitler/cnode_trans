@@ -4,6 +4,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:path/path.dart';
+import 'package:path_provider/path_provider.dart';
 import 'package:sqflite/sqflite.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 
@@ -31,22 +32,26 @@ class RoadEventService {
       if (Platform.isAndroid || Platform.isIOS) {
         debugPrint('[🔹 RoadEventService] Platform: ${Platform.operatingSystem}');
         sqfliteFfiInit();
-        // Используем databaseFactoryFfi вместо обычного databaseFactory!
-        final factory = databaseFactoryFfi;
         debugPrint('[🔹 RoadEventService] ✓ FFI factory initialized');
       }
 
-      // 2. Получаем правильный путь к БД
-      final dbPath = await getDatabasesPath();
-      final path = join(dbPath, "cameras.db");
+      // 2. КРИТИЧНО: Получаем ПРАВИЛЬНЫЙ путь через getApplicationDocumentsDirectory()
+      // getDatabasesPath() неправильно работает на эмуляторе через FFI!
+      final appDocDir = await getApplicationDocumentsDirectory();
+      final dbDir = Directory('${appDocDir.path}/databases');
+      
+      // Создаем папку если её нет
+      if (!dbDir.existsSync()) {
+        await dbDir.create(recursive: true);
+        debugPrint('[🔹 RoadEventService] Created databases directory: ${dbDir.path}');
+      }
+
+      final path = join(dbDir.path, "cameras.db");
       debugPrint('[🔹 RoadEventService] Database path: $path');
 
-      // 3. Создаем папку, если её нет
-      await Directory(dbPath).create(recursive: true);
-
-      // 4. Если БД не существует — копируем из assets
+      // 3. Проверяем файл и копируем из assets если нужно
       if (!await File(path).exists()) {
-        debugPrint('[🔹 RoadEventService] Copying cameras.db from assets...');
+        debugPrint('[🔹 RoadEventService] cameras.db not found, copying from assets...');
         try {
           final data = await rootBundle.load("assets/database/cameras.db");
           final bytes = data.buffer.asUint8List(
@@ -64,7 +69,7 @@ class RoadEventService {
         debugPrint('[🔹 RoadEventService] ✓ cameras.db exists (${fileSize} bytes)');
       }
 
-      // 5. КРИТИЧНО: Открываем БД через databaseFactoryFfi, а не openDatabase()!
+      // 4. КРИТИЧНО: Открываем БД через databaseFactoryFfi!
       debugPrint('[🔹 RoadEventService] Opening database via FFI...');
       _db = await databaseFactoryFfi.openDatabase(
         path,
@@ -94,7 +99,7 @@ class RoadEventService {
               );
 
               if (rtreeCheck.isNotEmpty) {
-                debugPrint('[🔹 RoadEventService] ✓ R*Tree index FOUND and available');
+                debugPrint('[🔹 RoadEventService] ✓ R*Tree index FOUND');
               } else {
                 debugPrint('[🔹 RoadEventService] ⚠ R*Tree index NOT found');
               }
